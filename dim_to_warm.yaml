@@ -1,0 +1,235 @@
+blueprint:
+  name: "Dim to Warm"
+  description: >
+    Automatically links brightness to color temperature – the lower the
+    brightness, the warmer (lower Kelvin) the light, and vice versa.
+
+    Select one or more lights. All lights share the same Kelvin range
+    and brightness zone settings. When a light's brightness changes,
+    only that specific light's color temperature is updated.
+
+    Configure:
+    • Min Kelvin (warmest) and Max Kelvin (coolest)
+    • Lower zone – below this brightness % min Kelvin is held constant
+    • Upper zone – above this brightness % max Kelvin is held constant
+    • In between, color temperature is interpolated linearly
+
+    Example with defaults (min=2500K, max=4000K, lower=10%, upper=90%):
+      0–10 %  brightness → 2500 K (warm, constant)
+      10–90 % brightness → 2500–4000 K (linear transition)
+      90–100 % brightness → 4000 K (cool, constant)
+
+  domain: automation
+  author: "robblids"
+  source_url: "https://github.com/robblids/ha-dim-to-warm/blob/main/dim_to_warm.yaml"
+  homeassistant:
+    min_version: "2024.6.0"
+  input:
+    # ── Lights ───────────────────────────────────────────────
+    light_section:
+      name: "Lights"
+      icon: mdi:lightbulb-group
+      description: "Select lights and configure the Kelvin range."
+      collapsed: false
+      input:
+        target_lights:
+          name: "Lights"
+          description: >
+            Select one or more lights to apply dim-to-warm to.
+            All selected lights will share the same settings.
+          selector:
+            entity:
+              domain: light
+              multiple: true
+
+        min_kelvin:
+          name: "Min Kelvin (warmest)"
+          description: >
+            Lowest color temperature. Used when brightness
+            is at or below the lower zone.
+          default: 2500
+          selector:
+            color_temp:
+              unit: kelvin
+              min: 1800
+              max: 6500
+
+        max_kelvin:
+          name: "Max Kelvin (coolest)"
+          description: >
+            Highest color temperature. Used when brightness
+            is at or above the upper zone.
+          default: 4000
+          selector:
+            color_temp:
+              unit: kelvin
+              min: 1800
+              max: 6500
+
+    # ── Zones ────────────────────────────────────────────────
+    zone_section:
+      name: "Brightness zones"
+      icon: mdi:chart-bell-curve-cumulative
+      description: >
+        Define the brightness ranges where color temperature
+        is held constant (lower/upper zone) or interpolated.
+      collapsed: false
+      input:
+        lower_zone:
+          name: "Lower zone (%)"
+          description: >
+            Below this brightness percentage, min Kelvin is always used.
+            The transition zone starts at this value.
+          default: 10
+          selector:
+            number:
+              min: 0
+              max: 99
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+
+        upper_zone:
+          name: "Upper zone (%)"
+          description: >
+            Above this brightness percentage, max Kelvin is always used.
+            The transition zone ends at this value.
+          default: 90
+          selector:
+            number:
+              min: 1
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+
+    # ── Behavior ─────────────────────────────────────────────
+    behavior_section:
+      name: "Behavior"
+      icon: mdi:cog
+      description: "Additional settings for the automation."
+      collapsed: true
+      input:
+        transition_time:
+          name: "Transition time"
+          description: >
+            Time in seconds for the color temperature change.
+            Set to 0 for instant changes.
+          default: 0.5
+          selector:
+            number:
+              min: 0
+              max: 10
+              step: 0.5
+              unit_of_measurement: "s"
+              mode: slider
+
+        apply_on_turn_on:
+          name: "Apply on turn on"
+          description: >
+            Also apply dim-to-warm immediately when a light
+            is turned on (not only on brightness changes).
+          default: true
+          selector:
+            boolean: {}
+
+# ═══════════════════════════════════════════════════════════════
+#  Variables
+# ═══════════════════════════════════════════════════════════════
+variables:
+  all_lights: !input target_lights
+  v_min_kelvin: !input min_kelvin
+  v_max_kelvin: !input max_kelvin
+  v_lower_zone: !input lower_zone
+  v_upper_zone: !input upper_zone
+  v_transition: !input transition_time
+  apply_on_turn_on: !input apply_on_turn_on
+
+  # The entity that triggered the automation
+  changed_light: "{{ trigger.entity_id }}"
+
+  # Calculate target Kelvin based on the triggering light's brightness
+  target_kelvin: >
+    {% set br = state_attr(changed_light, 'brightness') | default(0) | float(0) %}
+    {% set pct = (br / 255 * 100) | round(1) %}
+    {% set min_k = v_min_kelvin | float(2500) %}
+    {% set max_k = v_max_kelvin | float(4000) %}
+    {% set lower = v_lower_zone | float(10) %}
+    {% set upper = v_upper_zone | float(90) %}
+    {% if lower >= upper %}
+      {{ ((min_k + max_k) / 2) | round(0) }}
+    {% elif pct <= lower %}
+      {{ min_k | round(0) }}
+    {% elif pct >= upper %}
+      {{ max_k | round(0) }}
+    {% else %}
+      {% set ratio = (pct - lower) / (upper - lower) %}
+      {{ (min_k + ratio * (max_k - min_k)) | round(0) }}
+    {% endif %}
+
+  # Current Kelvin on the light – to avoid unnecessary calls
+  current_kelvin: >
+    {{ state_attr(changed_light, 'color_temp_kelvin') | default(0) | float(0) }}
+
+  # Only update if difference > 25K (prevents loops)
+  should_update: >
+    {{ (target_kelvin | float(0) - current_kelvin | float(0)) | abs > 25 }}
+
+# ═══════════════════════════════════════════════════════════════
+#  Triggers
+# ═══════════════════════════════════════════════════════════════
+triggers:
+  # Brightness changed on any of the selected lights
+  - trigger: state
+    entity_id: !input target_lights
+    attribute: brightness
+    id: "brightness_changed"
+
+  # Any of the selected lights turned on
+  - trigger: state
+    entity_id: !input target_lights
+    to: "on"
+    id: "light_turned_on"
+
+# ═══════════════════════════════════════════════════════════════
+#  Conditions
+# ═══════════════════════════════════════════════════════════════
+conditions:
+  # The triggering light must be on
+  - condition: template
+    value_template: "{{ is_state(changed_light, 'on') }}"
+
+  # Check if we should apply on turn-on events
+  - condition: or
+    conditions:
+      - condition: trigger
+        id: "brightness_changed"
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: "light_turned_on"
+          - condition: template
+            value_template: "{{ apply_on_turn_on }}"
+
+# ═══════════════════════════════════════════════════════════════
+#  Actions
+# ═══════════════════════════════════════════════════════════════
+mode: queued
+max: 10
+
+actions:
+  # Short delay to let brightness stabilize
+  - delay:
+      milliseconds: 150
+
+  # Only proceed if an update is actually needed
+  - condition: template
+    value_template: "{{ should_update }}"
+
+  # Set color temperature on the specific light that changed
+  - action: light.turn_on
+    target:
+      entity_id: "{{ changed_light }}"
+    data:
+      color_temp_kelvin: "{{ target_kelvin | int }}"
+      transition: "{{ v_transition | float(0.5) }}"
